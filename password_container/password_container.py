@@ -15,7 +15,7 @@ from xblock.validation import Validation
 from xmodule_django.models import CourseKeyField
 
 # We forked xblockutils because the old version living in the edx-plaform venv do not have StudioContainerXBlockMixin
-from xblockutils2.studio_editable import StudioContainerXBlockMixin
+from xblockutils2.studio_editable import StudioContainerXBlockMixin, ResourceLoader
 
 from .models import GroupConfiguration
 from .forms import PasswordContainerXBlockForm
@@ -26,6 +26,7 @@ TIME_LEFT_WARNING = 60 * 5
 
 # '%Y-%m-%dT%H:%M:%S.%f'
 
+loader = ResourceLoader(__name__)
 
 class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
     """
@@ -41,6 +42,7 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
         default="Time and password limited container",
         scope=Scope.settings
     )
+
     group_id = String(default="", scope=Scope.settings,
             display_name=u"Identifiant de groupe",
             help=u"Tous les Xblock ayant cet identifiant en commun seront débloqués en même temps.")
@@ -53,13 +55,49 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
             scope=Scope.preferences,
             help=u"Set to True if user has once been allowed to see children blocks"
             )
-    user_started = Dict(
+    user_start_time = Dict(
             scope=Scope.preferences,
             help=u"Time user started")
 
     def __init__(self, *args, **kwargs):
         super(PasswordContainerXBlock, self).__init__(*args, **kwargs)
         self.get_configuration()
+
+    def student_view(self, context=None):
+        user_start_time = self.get_user_start_time()
+        now = timezone.now()
+        fragment = Fragment()
+        fragment.add_css(self.resource_string('static/css/password-container.css'))
+        fragment.add_javascript(self.resource_string("static/js/src/password_container.js"))
+        if self.is_user_allowed():
+            if self.configuration.duration and (now > user_start_time + datetime.timedelta(minutes=self.configuration.duration)):
+                self.time_elapsed
+            else:
+                return self.display_children_content(fragment)
+        else:
+            if self.get_nb_tries() < MAX_TRIES:
+                self.ask_password()
+            else:
+                fragment = Fragment(self._render_template('static/html/4-not-available-anymore.html'))
+
+
+        return fragment
+    # # if self._is_studio():
+    # #     fragment = Fragment(self._render_template('static/html/studio.html'))
+    # #     fragment.add_css(self.resource_string('static/css/password-container.css'))
+    # #     return fragment
+
+    def display_children_content(self, fragment):
+        fragment.add_content(loader.render_template('static/html/password_container_info.html',
+                                                   {"user_is_staff": self.user_is_staff()}))
+        
+        children_frags = self.runtime.render_children(block=self, view_name='student_view')
+        fragment.add_content(loader.render_template('static/html/sequence.html',
+                                                    {'children': children_frags}))
+        fragment.add_frags_resources(children_frags)
+
+        fragment.initialize_js('PasswordContainerXBlock', 'startExam')
+        return fragment
 
     def _is_studio(self):
         studio = False
@@ -69,7 +107,7 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
             pass
         return studio
 
-    def _user_is_staff(self):
+    def user_is_staff(self):
         return getattr(self.runtime, 'user_is_staff', False)
 
     def get_icon_class(self):
@@ -84,7 +122,7 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
     def _render_template(self, ressource, **kwargs):
         template = Template(self.resource_string(ressource))
         context = dict({
-                'user_is_staff': self._user_is_staff(),
+                'user_is_staff': self.user_is_staff(),
                 'group_id': self.group_id,
                 'start_date': self.configuration.start_date,
                 'end_date': self.configuration.end_date,
@@ -100,6 +138,8 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
 
     def get_configuration(self, group_id=None):
         """Retrieve existing configuration if for a given `group_id` or create a new one."""
+
+        ## TODO REPLACE BY get_or_create https://docs.djangoproject.com/en/1.8/ref/models/querysets/#django.db.models.query.QuerySet.get_or_create
         group_id = group_id or self.group_id
         try:
             self.configuration = GroupConfiguration.objects.get(
@@ -114,15 +154,15 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
         else:
             return 0
 
-    def get_user_allowed(self):
+    def is_user_allowed(self):
         if self.group_id in self.user_allowed:
             return self.user_allowed[self.group_id]
         else:
             return False
 
-    def get_user_started(self):
-        if self.group_id in self.user_started and self.user_started[self.group_id]:
-            return dateutil.parser.parse(self.user_started[self.group_id])
+    def get_user_start_time(self):
+        if self.group_id in self.user_start_time and self.user_start_time[self.group_id]:
+            return dateutil.parser.parse(self.user_start_time[self.group_id])
         else:
             return None
 
@@ -135,13 +175,13 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
     def set_user_allowed(self, value):
         self.user_allowed[self.group_id] = value
 
-    def set_user_started(self, value):
-        self.user_started[self.group_id] = value.isoformat() if value else None
+    def set_user_start_time(self, value):
+        self.user_start_time[self.group_id] = value.isoformat() if value else None
 
     @XBlock.json_handler
     def reset_user_state(self, data, prefix=''):
         """Reset user state for testing purpose."""
-        if self._user_is_staff():
+        if self.user_is_staff():
             self.set_user_allowed(False)
             self.set_nb_tries(0)
             self.set_user_started(None)
@@ -267,56 +307,15 @@ class PasswordContainerXBlock(StudioContainerXBlockMixin, XBlock):
         self.render_children(context, fragment, can_reorder=True, can_add=True)
         return fragment
 
-    def student_view(self, context=None):
-        if self._is_studio():  # studio view
-            fragment = Fragment(self._render_template('static/html/studio.html'))
-            fragment.add_css(self.resource_string('static/css/password-container.css'))
-            return fragment
-
-        else:  # student view
-            if self.configuration.start_date and self.configuration.end_date:
-                user_started = self.get_user_started()
-                now = timezone.now()
-                if (now > self.configuration.start_date and now < self.configuration.end_date):
-                    # with are in the availability interval
-                    if self.get_user_allowed():
-                        # user is granted (entered a good password)
-                        if self.configuration.duration and (now > user_started + datetime.timedelta(minutes=self.configuration.duration)):
-                            # time allowed to access content is elapsed
-                            fragment = Fragment(self._render_template('static/html/5-time-elapsed.html'))
-                            fragment.initialize_js('PasswordContainerXBlock', 'bindResetButton')  # call Run to allow reset in debug mode
-                        else:
-                            # content is available
-                            fragment = Fragment(self._render_template('static/html/3-available.html'))
-                            child_frags = self.runtime.render_children(block=self, view_name='student_view', context=context)
-                            html = self._render_template('static/html/sequence.html', children=child_frags)
-                            fragment.add_content(html)
-                            fragment.add_frags_resources(child_frags)
-                            fragment.initialize_js('PasswordContainerXBlock', 'startExam')
-                    else:
-                        # user is not granted
-                        if self.get_nb_tries() < MAX_TRIES:
-                            # password is now required
-                            fragment = Fragment(self._render_template('static/html/2-enter-password.html'))
-                            child_frags = self.runtime.render_children(block=self, view_name='student_view', context=context)
-                            fragment.add_frags_resources(child_frags)
-                            fragment.initialize_js('PasswordContainerXBlock', 'checkPassword')
-                        else:
-                            # too much password failures
-                            fragment = Fragment(self._render_template('static/html/4-not-available-anymore.html'))
-
-                elif now > self.configuration.end_date:
-                    # content is no more available
-                    fragment = Fragment(self._render_template('static/html/4-not-available-anymore.html'))
-                else:
-                    # content is not yet available
-                    fragment = Fragment(self._render_template('static/html/1-not-yet-available.html'))
-
-                fragment.add_css(self.resource_string('static/css/password-container.css'))
-                fragment.add_javascript(self.resource_string("static/js/src/password_container.js"))
-
-                return fragment
-
-            # we should not be here !
-            frag = Fragment(u"Cette activité n'est pas disponible")
-            return frag
+             
+    def ask_password(self):
+        # password is now required
+        fragment = Fragment(self._render_template('static/html/2-enter-password.html'))
+        child_frags = self.runtime.render_children(block=self, view_name='student_view', context=context)
+        fragment.add_frags_resources(child_frags)
+        fragment.initialize_js('PasswordContainerXBlock', 'checkPassword')
+        
+    def time_elapsed(self):
+        fragment = Fragment(self._render_template('static/html/5-time-elapsed.html'))
+        fragment.initialize_js('PasswordContainerXBlock', 'bindResetButton')  # call Run to allow reset in debug mode
+        
